@@ -5,7 +5,7 @@
   "temperature": 0.7,
   "context_limit": 20,
   "deep_mini_enabled": true,
-  "deep_mini_model": "gpt-4o-mini",
+  "deep_mini_model": "mimo-v2.6-flash",
   "deep_mini_max_tokens": 900,
   "deep_mini_temperature": 0.7,
   "deep_mini_timeout": 90,
