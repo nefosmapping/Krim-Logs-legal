@@ -1,0 +1,16 @@
+# venv
+venv/
+__pycache__/
+*.py[cod]
+
+# Данные и логи бота
+logs/
+data/
+dossiers/
+config.json
+
+# Секреты
+.env
+
+# Блокировка запущенного экземпляра
+krim_logs.lock
