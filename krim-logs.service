@@ -1,0 +1,18 @@
+[Unit]
+Description=Krim Logs Discord bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/krim/discord-bot
+ExecStart=/home/krim/discord-bot/run.sh
+Restart=on-failure
+RestartSec=15
+User=krim
+# Если нужен режим Zapret (nfqws + nftables), бот должен работать от root.
+# Настройте NOPASSWD для nft/nfqws и замените ExecStart на:
+# ExecStart=/usr/bin/sudo -n /home/krim/discord-bot/run.sh
+
+[Install]
+WantedBy=multi-user.target

@@ -8,8 +8,11 @@ Krim Logs — бот для логирования событий Discord + AI-�
   #   vosk-model-small-ru-0.22/   (https://alphacephei.com/vosk/models)
 
 Запуск (только интерпретатором из venv):
-  run.bat
-  либо venv\\Scripts\\python.exe Krim_logs.py
+  Windows:  run.bat
+            либо venv\\Scripts\\python.exe Krim_logs.py
+  Linux:    ./run.sh
+            либо venv/bin/python Krim_logs.py
+            (для режима Zapret — через sudo или с NOPASSWD для nft/nfqws)
 
 Авто-транскрипция войса (config.json):
   "voice_auto": true,
@@ -96,7 +99,12 @@ if not hasattr(discord, "Intents"):
     raise SystemExit(1)
 
 try:
-    from netbypass import NetBypassManager
+    from netbypass import (
+        DEFAULT_VLESS_EXTRA_SOURCES,
+        DEFAULT_VLESS_KEY_INDEX,
+        DIRECT_MODE,
+        NetBypassManager,
+    )
 except ImportError as exc:  # модуль обхода отсутствует или повреждён
     _startup_error([
         f"missing module: netbypass ({exc})",
@@ -195,10 +203,13 @@ DEFAULT_AI_CONFIG = {
 DEFAULT_NETWORK_CONFIG = {
     "enabled": False,
     "mode": "vless",
-    "fallback": "proxy",
+    # Порядок резервных режимов: vless → zapret → proxy.
+    "fallback": ["zapret", "proxy"],
     "health_interval": 60,
     "vless": {
         "subscription": "https://warp-gen.cyb-portal.org/CP-040",
+        "extra_sources": list(DEFAULT_VLESS_EXTRA_SOURCES),
+        "keys_index": DEFAULT_VLESS_KEY_INDEX,
         "subscription_file": "",
         "subscription_url": "",
         "core_path": "",
@@ -206,7 +217,15 @@ DEFAULT_NETWORK_CONFIG = {
         "local_port": 0,
         "max_attempts": 0,
         "startup_timeout": 8,
+        "test_timeout": 15,
         "probe_concurrency": 6,
+    },
+    "zapret": {
+        "base_dir": "",
+        "core_path": "",
+        "strategy": "general.bat",
+        "interface": "",
+        "max_strategies": 4,
     },
     "proxy": {
         "sources": [
@@ -2170,7 +2189,8 @@ async def run_bot() -> None:
     try:
         proxy_url = await proxy_manager.start()
         proxy_manager.attach_client(client)
-        client.http.proxy = proxy_url
+        # Zapret обходит DPI прозрачно, поэтому прокси в discord.py не нужен.
+        client.http.proxy = None if proxy_url in (None, DIRECT_MODE) else proxy_url
     except Exception:
         log.exception(
             "Не удалось инициализировать сетевой обход — работаю напрямую"

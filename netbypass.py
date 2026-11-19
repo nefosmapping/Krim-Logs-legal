@@ -1,14 +1,15 @@
 """
 netbypass.py — обход блокировок Discord для Krim Logs.
 
-Поддерживаются два независимых режима, переключаемых в config.json:
+Поддерживаются три независимых режима, переключаемых в config.json:
 
   network.mode = "vless"
-      Берёт VLESS-подписку (файл рядом с ботом или URL), при необходимости
-      скачивает Xray-core, поднимает локальный HTTP-прокси 127.0.0.1:<port>
-      и гоняет весь трафик discord.py через него. Конфиги из подписки
-      перебираются до первого рабочего; при падении туннеля происходит
-      ротация на следующий конфиг.
+      Берёт VLESS-подписку (файл рядом с ботом или URL), BLACK/WHITE-списки
+      для России (igareck/vpn-configs-for-russia) и индекс проверенных ключей
+      (tiagorrg/vless-checker), при необходимости скачивает Xray-core,
+      поднимает локальный HTTP-прокси 127.0.0.1:<port> и гоняет весь трафик
+      discord.py через него. Конфиги перебираются до первого рабочего; при
+      падении туннеля происходит ротация на следующий конфиг.
 
   network.mode = "proxy"
       На старте скачивает публичные списки прокси, проверяет их строго по
@@ -16,9 +17,19 @@ netbypass.py — обход блокировок Discord для Krim Logs.
       держит активный сервер + N запасных (по умолчанию 4). При отказе
       активного прокси бот переключается на запасной, а пул пополняется.
 
+  network.mode = "zapret"
+      Обход DPI без сервера: на Linux запускает nfqws + nftables, на Windows —
+      winws.exe + WinDivert. Работает прозрачно, discord.py ходит напрямую.
+      Требует root/администратора и пакет libnetfilter-queue1 на Linux.
+      Помогает только при DPI-блокировках: если IP серверов Discord
+      заблокирован на уровне маршрутизации (TCP-таймаут), нужен VLESS.
+
+Резервные режимы задаются списком network.fallback и пробуются по порядку.
+
 Наружу отдаётся один HTTP-прокси URL. discord.py 2.x передаёт его и в REST
 (`HTTPClient.request`), и в WebSocket (`HTTPClient.ws_connect`), поэтому
-менеджер просто выставляет `client.http.proxy`.
+менеджер просто выставляет `client.http.proxy`. Для Zapret прокси не нужен —
+возвращается маркер ``DIRECT_MODE``, и клиент работает напрямую.
 
 Модуль не импортирует discord — только aiohttp и стандартную библиотеку.
 """
@@ -32,6 +43,7 @@ import logging
 import os
 import platform
 import random
+import re
 import shutil
 import socket
 import subprocess
@@ -49,6 +61,24 @@ import aiohttp
 
 DEFAULT_TEST_URL = "https://discord.com/api/v10/gateway"
 DEFAULT_SUBSCRIPTION_URL = "https://warp-gen.cyb-portal.org/CP-040"
+
+# Дополнительные источники VLESS-ключей для России. Список BLACK обновляется
+# автором ежедневно и содержит ключи, рассчитанные на обход блокировок РФ.
+DEFAULT_VLESS_EXTRA_SOURCES = (
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS.txt",
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS_mobile.txt",
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/WHITE-CIDR-RU-checked.txt",
+)
+
+# Готовый индекс уже проверенных ключей (tiagorrg/vless-checker, обновляется
+# по расписанию GitHub Actions). Ключи оттуда пробуются первыми.
+DEFAULT_VLESS_KEY_INDEX = (
+    "https://raw.githubusercontent.com/tiagorrg/vless-checker/main/docs/keys.json"
+)
+
+# Маркер режима Zapret: он не даёт HTTP-прокси, а прозрачно обходит DPI,
+# поэтому discord.py должен ходить напрямую (proxy=None).
+DIRECT_MODE = "direct"
 
 # Публичные списки прокси. Проверка всё равно жёсткая: прокси попадёт в пул
 # только если через него открывается HTTPS-страница Discord с валидным TLS.
@@ -112,6 +142,7 @@ class VlessConfig:
     packet_encoding: str = ""
     extra: Optional[dict] = None
     label: str = ""
+    priority: int = 0
 
     @property
     def key(self) -> tuple:
@@ -134,7 +165,9 @@ class VlessConfig:
 
     def score(self) -> int:
         """Чем больше, тем раньше пробуем конфиг."""
-        score = 0
+        # Ключи из проверенного индекса и BLACK-списков важнее случайной
+        # подписки, поэтому приоритет источника доминирует над типом транспорта.
+        score = self.priority * 1000
         if self.security == "reality":
             score += 40
         elif self.security == "tls":
@@ -320,6 +353,14 @@ class NetBypassManager:
         self._mode: Optional[str] = None
         self._proxy_url: Optional[str] = None
         self._client: Any = None
+        self._zapret_active: bool = False
+        self._zapret_proc: Optional[asyncio.subprocess.Process] = None
+        self._zapret_procs: list[asyncio.subprocess.Process] = []
+        self._zapret_nft_rules: list[str] = []
+        self._zapret_interface: str = ""
+        self._zapret_desc: str = ""
+        self._sudo_checked: Optional[bool] = None
+        self._nfqws_opts: Optional[set[str]] = None
 
         self._stop = asyncio.Event()
         self._watchdog_task: Optional[asyncio.Task] = None
@@ -334,6 +375,7 @@ class NetBypassManager:
 
         self._vless_pool: list[VlessConfig] = []
         self._vless_index: int = -1
+        self._vless_priority: dict[str, int] = {}
         self._backups: list[str] = []
         self._last_refresh: float = 0.0
 
@@ -353,6 +395,8 @@ class NetBypassManager:
         return bool(self.config.get("enabled", False))
 
     def describe(self) -> str:
+        if self._mode == "zapret" and self._zapret_active:
+            return self._zapret_desc or "Zapret (обход DPI)"
         if not self._proxy_url:
             return "выключен"
         if self._mode == "vless":
@@ -384,18 +428,30 @@ class NetBypassManager:
             "vless": vless,
             "backups": list(self._backups),
             "pool_size": self._pool_size,
+            "zapret": {
+                "active": self._zapret_active,
+                "interface": self._zapret_interface,
+                "description": self._zapret_desc,
+            }
+            if self._mode == "zapret"
+            else None,
         }
 
     def attach_client(self, client: Any) -> None:
         """Привязывает discord.py-клиент, чтобы менеджер мог менять прокси."""
         self._client = client
         try:
-            client.http.proxy = self._proxy_url
+            client.http.proxy = None if self._zapret_active else self._proxy_url
         except Exception:
             self.log.debug("Не удалось сразу выставить прокси в клиенте", exc_info=True)
 
     async def start(self) -> Optional[str]:
-        """Поднимает выбранный режим. Возвращает URL HTTP-прокси или None."""
+        """Поднимает выбранный режим. Возвращает URL HTTP-прокси или None.
+
+        Zapret не создаёт прокси, поэтому в этом режиме возвращается маркер
+        ``DIRECT_MODE``: discord.py работает напрямую, а DPI обходится на
+        уровне ОС (nfqws + nftables на Linux, winws + WinDivert на Windows).
+        """
         if not self.enabled:
             self.log.info("Сетевой обход отключён (network.enabled=false)")
             return None
@@ -404,32 +460,35 @@ class NetBypassManager:
         mode = str(self.config.get("mode", "vless")).strip().lower()
         self.log.info("Сетевой обход включён, режим: %s", mode)
 
-        url: Optional[str] = None
-        try:
-            if mode == "vless":
-                url = await self._start_vless()
-            elif mode == "proxy":
-                url = await self._start_proxy()
-            else:
-                self.log.error(
-                    "Неизвестный network.mode=%r (ожидается 'vless' или 'proxy')", mode
-                )
-        except Exception:
-            self.log.exception("Ошибка запуска режима %s", mode)
+        # Резервные режимы: fallback может быть строкой или списком строк.
+        raw_fallback = self.config.get("fallback", "proxy")
+        if isinstance(raw_fallback, str):
+            fallbacks = [raw_fallback]
+        elif isinstance(raw_fallback, (list, tuple)):
+            fallbacks = [str(item) for item in raw_fallback]
+        else:
+            fallbacks = []
+        chain: list[str] = [mode]
+        for item in fallbacks:
+            item = item.strip().lower()
+            if item and item not in chain:
+                chain.append(item)
 
-        fallback = str(self.config.get("fallback", "proxy")).strip().lower()
-        if not url and fallback in ("proxy", "vless") and fallback != mode:
-            self.log.warning(
-                "Режим %s не поднялся — пробую резервный режим %s", mode, fallback
-            )
-            try:
-                url = (
-                    await self._start_proxy()
-                    if fallback == "proxy"
-                    else await self._start_vless()
+        url: Optional[str] = None
+        for index, candidate in enumerate(chain):
+            if index:
+                self.log.warning(
+                    "Режим %s не поднялся — пробую резервный режим %s",
+                    chain[index - 1],
+                    candidate,
                 )
+            try:
+                url = await self._start_mode(candidate)
             except Exception:
-                self.log.exception("Резервный режим %s не поднялся", fallback)
+                self.log.exception("Ошибка запуска режима %s", candidate)
+                url = None
+            if url:
+                break
 
         if not url:
             self.log.error(
@@ -445,6 +504,23 @@ class NetBypassManager:
         self.log.info("Сетевой обход активен: %s", self.describe())
         return url
 
+    async def _start_mode(self, mode: str) -> Optional[str]:
+        """Запускает один конкретный режим обхода."""
+        if mode == "vless":
+            return await self._start_vless()
+        if mode == "proxy":
+            return await self._start_proxy()
+        if mode == "zapret":
+            return await self._start_zapret()
+        if mode in ("none", "direct", "off"):
+            self._mode = "direct"
+            return DIRECT_MODE if await self._test_direct() else None
+        self.log.error(
+            "Неизвестный network.mode=%r (ожидается 'vless', 'proxy' или 'zapret')",
+            mode,
+        )
+        return None
+
     async def stop(self) -> None:
         self._stop.set()
         task = self._watchdog_task
@@ -456,6 +532,7 @@ class NetBypassManager:
             except (asyncio.CancelledError, Exception):
                 pass
         await self._stop_xray()
+        await self._stop_zapret()
         if self._client is not None:
             try:
                 self._client.http.proxy = None
@@ -482,6 +559,12 @@ class NetBypassManager:
     @property
     def _test_timeout(self) -> int:
         return max(2, self._int(self._section("proxy"), "test_timeout", 8))
+
+    @property
+    def _vless_test_timeout(self) -> int:
+        # VLESS-туннелю нужно больше времени на TLS/Reality handshake, чем
+        # обычному HTTP-прокси, поэтому таймаут задаётся отдельно.
+        return max(3, self._int(self._section("vless"), "test_timeout", 15))
 
     @property
     def _pool_size(self) -> int:
@@ -527,6 +610,7 @@ class NetBypassManager:
         proxy_url: str,
         session: Optional[aiohttp.ClientSession] = None,
         confirm: Optional[int] = None,
+        timeout: Optional[int] = None,
     ) -> Optional[float]:
         """Проверяет прокси запросом к Discord по HTTPS. Возвращает мс или None.
 
@@ -535,16 +619,19 @@ class NetBypassManager:
         сервера, которые отдают ровно один ответ и сразу умирают.
         """
         attempts = self._verify_attempts if confirm is None else max(1, confirm)
+        total = max(2, timeout or self._test_timeout)
         own_session = session is None
         if own_session:
             session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self._test_timeout),
+                timeout=aiohttp.ClientTimeout(total=total),
                 connector=aiohttp.TCPConnector(force_close=True),
             )
         try:
             latency: Optional[float] = None
             for _ in range(attempts):
-                current = await self._single_proxy_request(proxy_url, session)
+                current = await self._single_proxy_request(
+                    proxy_url, session, total
+                )
                 if current is None:
                     return None
                 if latency is None:
@@ -555,15 +642,18 @@ class NetBypassManager:
                 await session.close()
 
     async def _single_proxy_request(
-        self, proxy_url: str, session: aiohttp.ClientSession
+        self,
+        proxy_url: str,
+        session: aiohttp.ClientSession,
+        timeout: Optional[int] = None,
     ) -> Optional[float]:
         try:
             started = time.perf_counter()
-            timeout = aiohttp.ClientTimeout(total=self._test_timeout)
+            total = max(2, timeout or self._test_timeout)
             async with session.get(
                 self._test_url,
                 proxy=proxy_url,
-                timeout=timeout,
+                timeout=aiohttp.ClientTimeout(total=total),
                 allow_redirects=False,
                 headers={"Connection": "close"},
             ) as response:
@@ -579,6 +669,29 @@ class NetBypassManager:
         except Exception:
             self.log.debug("Ошибка проверки прокси %s", proxy_url, exc_info=True)
             return None
+
+    async def _test_direct(self, timeout: Optional[int] = None) -> bool:
+        """Проверяет Discord без прокси (нужно для режима Zapret)."""
+        total = max(3, timeout or self._vless_test_timeout)
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=total),
+                connector=aiohttp.TCPConnector(force_close=True),
+            ) as session:
+                async with session.get(
+                    self._test_url,
+                    allow_redirects=False,
+                    headers={"Connection": "close"},
+                ) as response:
+                    if response.status not in (200, 204):
+                        return False
+                    body = await response.read()
+                    return b'"url"' in body or b"discord" in body.lower()
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError):
+            return False
+        except Exception:
+            self.log.debug("Ошибка прямой проверки Discord", exc_info=True)
+            return False
 
     # -- режим VLESS --------------------------------------------------------
 
@@ -744,7 +857,9 @@ class NetBypassManager:
                 return None
 
             proxy_url = f"http://127.0.0.1:{port}"
-            latency = await self._test_proxy(proxy_url, confirm=1)
+            latency = await self._test_proxy(
+                proxy_url, confirm=1, timeout=self._vless_test_timeout
+            )
             if latency is None:
                 await self._terminate_proc(proc, log_handle)
                 return None
@@ -849,7 +964,12 @@ class NetBypassManager:
     async def _vless_health(self) -> None:
         if not self._proxy_url:
             return
-        if await self._test_proxy(self._proxy_url) is not None:
+        if (
+            await self._test_proxy(
+                self._proxy_url, timeout=self._vless_test_timeout
+            )
+            is not None
+        ):
             return
 
         self.log.warning("VLESS: туннель перестал отвечать — ротация конфига")
@@ -867,11 +987,34 @@ class NetBypassManager:
                 self._apply(url, "rescan")
                 return
 
-        self.log.error("VLESS: рабочих конфигов нет — перехожу на пул HTTPS-прокси")
-        self._mode = "proxy"
-        new_url = await self._refresh_proxy_pool(keep_active=False)
-        if new_url:
-            self._apply(new_url, "fallback")
+        self.log.error("VLESS: рабочих конфигов нет — пробую резервные режимы")
+        await self._fallback_from("vless")
+
+    async def _fallback_from(self, current: str) -> None:
+        """Пробует резервные режимы из network.fallback по порядку."""
+        raw = self.config.get("fallback", "proxy")
+        if isinstance(raw, str):
+            fallbacks = [raw]
+        elif isinstance(raw, (list, tuple)):
+            fallbacks = [str(item) for item in raw]
+        else:
+            fallbacks = []
+
+        for mode in fallbacks:
+            mode = mode.strip().lower()
+            if not mode or mode == current:
+                continue
+            self.log.warning("Сетевой обход: пробую резервный режим %s", mode)
+            try:
+                url = await self._start_mode(mode)
+            except Exception:
+                self.log.exception("Резервный режим %s не поднялся", mode)
+                url = None
+            if url:
+                self._apply(url, "fallback")
+                return
+
+        self.log.error("Сетевой обход: ни один резервный режим не поднялся")
 
     async def _load_vless_configs(self, force_refresh: bool = False) -> list[VlessConfig]:
         text = await self._load_subscription_text(force_refresh=force_refresh)
@@ -889,6 +1032,7 @@ class NetBypassManager:
             if cfg is None or cfg.key in seen:
                 continue
             seen.add(cfg.key)
+            cfg.priority = self._vless_priority.get(line, 0)
             configs.append(cfg)
         configs.sort(key=lambda item: item.score(), reverse=True)
         return configs
@@ -923,6 +1067,7 @@ class NetBypassManager:
         для обратной совместимости.
         """
         vless_cfg = self._section("vless")
+        self._vless_priority = {}
         raw_subscription = vless_cfg.get("subscription")
 
         subscription_items: list[str] = []
@@ -971,17 +1116,64 @@ class NetBypassManager:
         if not subscription_urls and not raw_lines:
             subscription_urls.append(DEFAULT_SUBSCRIPTION_URL)
 
+        # Дополнительные источники ключей (BLACK/WHITE-списки для России).
+        extra = vless_cfg.get("extra_sources", DEFAULT_VLESS_EXTRA_SOURCES)
+        if isinstance(extra, str):
+            extra_sources = [extra] if extra.strip() else []
+        elif isinstance(extra, (list, tuple)):
+            extra_sources = [str(item).strip() for item in extra if str(item).strip()]
+        elif extra is None:
+            extra_sources = list(DEFAULT_VLESS_EXTRA_SOURCES)
+        else:
+            extra_sources = []
+
+        # Индекс уже проверенных ключей tiagorrg/vless-checker.
+        keys_index = vless_cfg.get("keys_index", DEFAULT_VLESS_KEY_INDEX)
+        if isinstance(keys_index, str):
+            key_index_urls = [keys_index.strip()] if keys_index.strip() else []
+        elif isinstance(keys_index, (list, tuple)):
+            key_index_urls = [str(item).strip() for item in keys_index if str(item).strip()]
+        elif keys_index is None:
+            key_index_urls = [DEFAULT_VLESS_KEY_INDEX]
+        else:
+            key_index_urls = []
+
         fetched_parts: list[str] = []
+
+        # 1) BLACK/WHITE-списки для РФ — самые актуальные ключи, пробуем первыми.
+        for url in extra_sources:
+            fetched = await self._fetch_subscription(url)
+            if not fetched:
+                continue
+            for line in fetched.splitlines():
+                line = line.strip()
+                if line.startswith("vless://"):
+                    self._vless_priority.setdefault(line, 3)
+            fetched_parts.append(fetched)
+
+        # 2) Индекс уже проверенных ключей tiagorrg/vless-checker.
+        for url in key_index_urls:
+            keys = await self._fetch_keys_index(url)
+            if not keys:
+                continue
+            self.log.info("VLESS: индекс ключей %s — %d шт.", url, len(keys))
+            for key in keys:
+                self._vless_priority.setdefault(key, 2)
+            fetched_parts.append("\n".join(keys))
+
+        # 3) Основная подписка.
         for url in dict.fromkeys(subscription_urls):
             fetched = await self._fetch_subscription(url)
             if not fetched:
                 continue
+            for line in fetched.splitlines():
+                line = line.strip()
+                if line.startswith("vless://"):
+                    self._vless_priority.setdefault(line, 1)
             fetched_parts.append(fetched)
-            try:
-                self._cache_file.parent.mkdir(parents=True, exist_ok=True)
-                self._cache_file.write_text(fetched, encoding="utf-8")
-            except OSError:
-                pass
+
+        for line in raw_lines:
+            self._vless_priority.setdefault(line, 1)
 
         text = "\n".join([*raw_lines, *fetched_parts])
 
@@ -994,8 +1186,64 @@ class NetBypassManager:
                     self.log.info("VLESS: подписка недоступна, использую кэш")
             except OSError:
                 pass
+        else:
+            try:
+                self._cache_file.parent.mkdir(parents=True, exist_ok=True)
+                self._cache_file.write_text(text, encoding="utf-8")
+            except OSError:
+                pass
 
         return text
+
+    async def _fetch_keys_index(self, url: str) -> list[str]:
+        """Скачивает docs/keys.json (tiagorrg/vless-checker) и вытаскивает ключи.
+
+        Формат индекса — словарь режимов, в каждом из которых есть ``best``
+        (строка) и ``top10`` (список объектов с полем ``key``). Структура может
+        меняться, поэтому ключи собираются рекурсивно по всему документу.
+        """
+        headers = {"User-Agent": "v2rayN/6.31"}
+        timeout = aiohttp.ClientTimeout(total=20)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        self.log.warning(
+                            "VLESS: индекс ключей вернул HTTP %s", response.status
+                        )
+                        return []
+                    data = await response.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
+            self.log.warning("VLESS: не удалось скачать индекс ключей: %s", exc)
+            return []
+
+        found: list[str] = []
+
+        def add(value: Any) -> None:
+            if isinstance(value, str) and value.strip().startswith("vless://"):
+                found.append(value.strip())
+
+        def walk(node: Any) -> None:
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if key == "best":
+                        add(value)
+                    elif key in ("top10", "top5") and isinstance(value, (list, tuple)):
+                        # Достаточно пары лучших ключей на режим, иначе перебор
+                        # индекса занимает слишком много времени.
+                        for item in value[:2]:
+                            add(item.get("key") if isinstance(item, dict) else item)
+                    elif isinstance(value, (dict, list, tuple)):
+                        walk(value)
+                    else:
+                        add(value)
+            elif isinstance(node, (list, tuple)):
+                for item in node:
+                    walk(item)
+
+        walk(data)
+        # Ограничиваем размер индекса, чтобы не перебирать сотни ключей.
+        return list(dict.fromkeys(found))[:30]
 
     async def _fetch_subscription(self, url: str) -> str:
         headers = {"User-Agent": "v2rayN/6.31"}
@@ -1385,6 +1633,566 @@ class NetBypassManager:
         if url:
             self._apply(url, "rescan")
 
+    # -- режим Zapret (обход DPI) ------------------------------------------
+
+    @staticmethod
+    def _is_windows_admin() -> bool:
+        if os.name != "nt":
+            return False
+        try:
+            import ctypes
+
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+
+    def _sudo_ok(self) -> bool:
+        """Проверяет, доступен ли sudo без запроса пароля (результат кэшируется)."""
+        if self._sudo_checked is not None:
+            return self._sudo_checked
+        if os.name == "nt" or os.geteuid() == 0:
+            self._sudo_checked = True
+            return True
+        try:
+            result = subprocess.run(
+                ["sudo", "-n", "true"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+            self._sudo_checked = result.returncode == 0
+        except Exception:
+            self._sudo_checked = False
+        return self._sudo_checked
+
+    def _root_prefix(self) -> Optional[list[str]]:
+        if os.name == "nt":
+            return [] if self._is_windows_admin() else None
+        if os.geteuid() == 0:
+            return []
+        return ["sudo", "-n"] if self._sudo_ok() else None
+
+    async def _run_privileged(
+        self, args: list[str], timeout: int = 20
+    ) -> tuple[int, str]:
+        prefix = self._root_prefix()
+        if prefix is None:
+            return 1, "нет прав root"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *prefix,
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        except FileNotFoundError as exc:
+            return 127, str(exc)
+        try:
+            output, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            return 124, "timeout"
+        return proc.returncode or 0, (output or b"").decode("utf-8", "ignore")
+
+    @staticmethod
+    def _default_interface() -> str:
+        if os.name == "nt":
+            return ""
+        try:
+            result = subprocess.run(
+                ["ip", "route", "show", "default"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            match = re.search(r"dev\s+(\S+)", result.stdout)
+            if match:
+                return match.group(1)
+        except Exception:
+            pass
+        try:
+            for name in os.listdir("/sys/class/net"):
+                if name != "lo":
+                    return name
+        except OSError:
+            pass
+        return ""
+
+    @staticmethod
+    def _nfqws_libs_ok() -> bool:
+        if os.name == "nt" or sys.platform == "darwin":
+            return True
+        try:
+            result = subprocess.run(
+                ["ldconfig", "-p"], capture_output=True, text=True, timeout=10
+            )
+            return "libnetfilter_queue" in result.stdout
+        except Exception:
+            return True
+
+    def _find_zapret(self) -> Optional[tuple[Path, Path]]:
+        """Ищет стратегию и исполняемый файл ядра Zapret.
+
+        Возвращает (файл стратегии .bat, путь к nfqws/winws) или None.
+        """
+        zapret_cfg = self._section("zapret")
+        explicit_dir = str(zapret_cfg.get("base_dir") or "").strip()
+        candidates: list[Path] = []
+        if explicit_dir:
+            path = Path(explicit_dir).expanduser()
+            if not path.is_absolute():
+                path = self.base_dir / path
+            candidates.append(path)
+        candidates.extend([self.base_dir / "zapret", self.base_dir / "bin" / "zapret"])
+        for parent in (self.base_dir, self.base_dir.parent, Path.home()):
+            try:
+                for child in sorted(parent.glob("zapret*")):
+                    if child.is_dir():
+                        candidates.append(child)
+            except OSError:
+                pass
+
+        exe_name = "winws.exe" if os.name == "nt" else "nfqws"
+        custom_exe = str(zapret_cfg.get("core_path") or "").strip()
+        if custom_exe:
+            exe = Path(custom_exe).expanduser()
+            if not exe.is_absolute():
+                exe = self.base_dir / exe
+            if exe.exists():
+                strategy = self._find_strategy(exe.parent)
+                if strategy:
+                    return strategy, exe
+
+        seen: set[Path] = set()
+        for directory in candidates:
+            try:
+                directory = directory.resolve()
+            except OSError:
+                pass
+            if directory in seen or not directory.exists():
+                continue
+            seen.add(directory)
+            strategy = self._find_strategy(directory)
+            if strategy is None:
+                continue
+            exe = directory / exe_name
+            if not exe.exists():
+                nested = list(directory.rglob(exe_name))
+                if not nested:
+                    continue
+                exe = nested[0]
+            return strategy, exe
+        return None
+
+    def _find_strategy(self, directory: Path) -> Optional[Path]:
+        zapret_cfg = self._section("zapret")
+        configured = str(zapret_cfg.get("strategy") or "").strip()
+        if configured:
+            path = Path(configured)
+            if not path.is_absolute():
+                for base in (directory, self.base_dir):
+                    if (base / path).exists():
+                        return base / path
+            elif path.exists():
+                return path
+        for name in ("general.bat", "general_alt.bat", "discord.bat"):
+            try:
+                for candidate in sorted(directory.rglob(name)):
+                    return candidate
+            except OSError:
+                pass
+        return None
+
+    @staticmethod
+    def _read_bat_command(path: Path) -> str:
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return ""
+        joined: list[str] = []
+        buffer = ""
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("::"):
+                continue
+            low = line.lower()
+            if low.startswith(("@", "chcp", "call ", "set ", "cd ", "echo")):
+                continue
+            if line.endswith("^"):
+                buffer += line[:-1] + " "
+                continue
+            buffer += line
+            joined.append(buffer)
+            buffer = ""
+        if buffer:
+            joined.append(buffer)
+        command = " ".join(joined)
+        base = str(path.parent)
+        command = command.replace("%~dp0", base + os.sep)
+        command = command.replace("%BIN%", base + os.sep + "bin" + os.sep)
+        command = command.replace("%LISTS%", base + os.sep + "lists" + os.sep)
+        command = command.replace("%GameFilterTCP%", "")
+        command = command.replace("%GameFilterUDP%", "")
+        command = re.sub(r'start\s+"[^"]*"\s*(/[A-Za-z]+\s+)*', "", command, flags=re.I)
+        command = re.sub(r'"[^"]*winws\.exe"\s*', "", command, flags=re.I)
+        # После удаления GameFilter остаются висящие запятые в списках портов.
+        command = re.sub(r",{2,}", ",", command)
+        command = re.sub(r",(?=\s|$)", "", command)
+        return command
+
+    def _parse_nfqws_strategy(self, path: Path) -> tuple[list[str], list[list[str]]]:
+        """Превращает Windows-стратегию .bat в nft-правила и аргументы nfqws."""
+        command = self._read_bat_command(path)
+        parts = [part.strip() for part in re.split(r"--new\b", command) if part.strip()]
+        nft_rules: list[str] = []
+        params_list: list[list[str]] = []
+        for part in parts:
+            match = re.search(r"--filter-(tcp|udp)=([0-9,\-]+)", part)
+            if not match:
+                continue
+            proto, ports = match.group(1), match.group(2)
+            if not re.fullmatch(r"[0-9,\-]+", ports):
+                continue
+            tokens = [token for token in re.split(r"\s+", part) if token]
+            params: list[str] = []
+            skip_next = False
+            for token in tokens:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if token.startswith(("--filter-", "--wf-")):
+                    if "=" not in token:
+                        skip_next = True
+                    continue
+                params.append(token.replace('"', ""))
+            if not params:
+                continue
+            queue = len(nft_rules)
+            nft_rules.append(
+                f"{proto} dport {{ {ports} }} counter queue num {queue} bypass"
+            )
+            params_list.append(params)
+        return nft_rules, params_list
+
+    def _parse_winws_args(self, path: Path) -> list[str]:
+        command = self._read_bat_command(path)
+        tokens = [token.replace('"', "") for token in re.split(r"\s+", command) if token]
+        args: list[str] = []
+        for token in tokens:
+            low = token.lower()
+            if not token or low == "start" or "winws.exe" in low:
+                continue
+            args.append(token)
+        return args
+
+    async def _nft_script(self, script: str, timeout: int = 20) -> tuple[int, str]:
+        """Выполняет ``nft -f -`` через sudo -n, без запуска shell.
+
+        Так в sudoers достаточно разрешить только /usr/sbin/nft, nfqws и pkill,
+        не давая пользователю произвольный root-shell.
+        """
+        prefix = self._root_prefix()
+        if prefix is None:
+            return 1, "нет прав root"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *prefix,
+                "nft",
+                "-f",
+                "-",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        except FileNotFoundError as exc:
+            return 127, str(exc)
+        try:
+            output, _ = await asyncio.wait_for(
+                proc.communicate(script.encode("utf-8")), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            return 124, "timeout"
+        return proc.returncode or 0, (output or b"").decode("utf-8", "ignore")
+
+    async def _zapret_cleanup_rules(self) -> None:
+        if os.name == "nt":
+            return
+        if not (os.geteuid() == 0 or self._sudo_ok()):
+            return
+        await self._nft_script("delete table inet zapretunix\n", timeout=10)
+        self._zapret_nft_rules = []
+
+    def _nfqws_supported(self, exe: Path) -> set[str]:
+        """Возвращает набор опций, которые понимает данный nfqws."""
+        if self._nfqws_opts is not None:
+            return self._nfqws_opts
+        options: set[str] = set()
+        try:
+            result = subprocess.run(
+                [str(exe), "--help"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            options = set(
+                re.findall(r"--[a-z0-9][a-z0-9-]*", result.stdout + result.stderr)
+            )
+        except Exception:
+            self.log.debug(
+                "Zapret: не удалось получить список опций nfqws", exc_info=True
+            )
+        self._nfqws_opts = options
+        return options
+
+    def _prepare_nfqws_params(self, params: list[str], exe: Path) -> list[str]:
+        """Готовит аргументы nfqws под конкретную версию ядра.
+
+        Windows-стратегии Flowseal используют опции winws, которых нет в nfqws
+        (например, --dpi-desync-fake-discord), и ссылаются на отсутствующие
+        пользовательские списки. Неподдерживаемые опции отбрасываются,
+        пустые user-списки создаются, остальные битые пути пропускаются.
+        """
+        supported = self._nfqws_supported(exe)
+        file_options = {
+            "--hostlist",
+            "--hostlist-exclude",
+            "--ipset",
+            "--ipset-exclude",
+        }
+        result: list[str] = []
+        for token in params:
+            name, sep, value = token.partition("=")
+            if sep and name.startswith("--"):
+                if supported and name not in supported:
+                    continue
+                if name in file_options and value:
+                    path = Path(value)
+                    if not path.exists():
+                        if "user" in path.name.lower():
+                            try:
+                                path.parent.mkdir(parents=True, exist_ok=True)
+                                path.touch()
+                            except OSError:
+                                continue
+                        else:
+                            continue
+            result.append(token)
+        return result
+
+    async def _apply_zapret_strategy(
+        self, strategy: Path, exe: Path, interface: str
+    ) -> bool:
+        nft_rules, params_list = self._parse_nfqws_strategy(strategy)
+        if not nft_rules:
+            self.log.warning("Zapret: в стратегии %s нет правил", strategy.name)
+            return False
+
+        await self._zapret_cleanup_rules()
+        script_lines = [
+            "add table inet zapretunix",
+            "add chain inet zapretunix output "
+            "{ type filter hook output priority 0 ; }",
+        ]
+        for rule in nft_rules:
+            script_lines.append(
+                f'add rule inet zapretunix output oifname "{interface}" '
+                f'{rule} comment "krim-zapret"'
+            )
+        code, out = await self._nft_script("\n".join(script_lines) + "\n")
+        if code != 0:
+            self.log.error("Zapret: nft: %s", out.strip()[:300])
+            await self._zapret_cleanup_rules()
+            return False
+        self._zapret_nft_rules = list(nft_rules)
+
+        for queue, params in enumerate(params_list):
+            prepared = self._prepare_nfqws_params(params, exe)
+            if not prepared:
+                continue
+            code, out = await self._run_privileged(
+                [str(exe), "--daemon", f"--qnum={queue}", *prepared], timeout=20
+            )
+            if code != 0:
+                self.log.error(
+                    "Zapret: nfqws qnum=%d код %s: %s",
+                    queue,
+                    code,
+                    out.strip()[:300],
+                )
+                await self._stop_zapret()
+                return False
+
+        await asyncio.sleep(1.5)
+        if not await self._test_direct():
+            self.log.warning(
+                "Zapret: стратегия %s не открыла Discord", strategy.name
+            )
+            await self._stop_zapret()
+            return False
+        self._zapret_desc = f"Zapret ({strategy.stem}, iface {interface})"
+        self.log.info("Zapret: стратегия %s работает", strategy.name)
+        return True
+
+    def _zapret_strategies(self, strategy: Path) -> list[Path]:
+        configured = self._find_strategy(strategy.parent)
+        result: list[Path] = []
+        if configured is not None:
+            result.append(configured)
+        try:
+            for path in sorted(strategy.parent.rglob("general*.bat")):
+                if path not in result:
+                    result.append(path)
+        except OSError:
+            pass
+        limit = max(1, self._int(self._section("zapret"), "max_strategies", 4))
+        return result[:limit]
+
+    async def _start_zapret_linux(self) -> Optional[str]:
+        found = self._find_zapret()
+        if not found:
+            self.log.error(
+                "Zapret: не найден nfqws/стратегия. Укажите network.zapret.base_dir "
+                "в config.json или положите папку zapret рядом с ботом."
+            )
+            return None
+        strategy, exe = found
+
+        if os.geteuid() != 0 and not self._sudo_ok():
+            self.log.error(
+                "Zapret: нужны права root. Запустите бота через sudo "
+                "(sudo venv/bin/python Krim_logs.py) либо разрешите nft и nfqws "
+                "без пароля в /etc/sudoers.d (см. PROXY_SETUP.md)."
+            )
+            return None
+        if not shutil.which("nft"):
+            self.log.error(
+                "Zapret: не найден nft. Установите пакеты: "
+                "sudo apt install nftables libnetfilter-queue1"
+            )
+            return None
+        if not self._nfqws_libs_ok():
+            self.log.error(
+                "Zapret: nfqws не запускается — нет libnetfilter_queue.so. "
+                "Установите: sudo apt install libnetfilter-queue1 nftables"
+            )
+            return None
+
+        interface = (
+            str(self._section("zapret").get("interface") or "").strip()
+            or self._default_interface()
+        )
+        if not interface or not re.fullmatch(r"[A-Za-z0-9_.:@\-]+", interface):
+            self.log.error("Zapret: не удалось определить сетевой интерфейс")
+            return None
+        self._zapret_interface = interface
+
+        strategies = self._zapret_strategies(strategy)
+        for index, candidate in enumerate(strategies, 1):
+            self.log.info(
+                "Zapret: стратегия %s (%d/%d)", candidate.name, index, len(strategies)
+            )
+            if await self._apply_zapret_strategy(candidate, exe, interface):
+                return DIRECT_MODE
+        self.log.error("Zapret: ни одна стратегия не открыла Discord")
+        return None
+
+    async def _start_zapret_windows(self) -> Optional[str]:
+        if not self._is_windows_admin():
+            self.log.error(
+                "Zapret: нужны права администратора. Запустите бота от имени "
+                "администратора."
+            )
+            return None
+        found = self._find_zapret()
+        if not found:
+            self.log.error(
+                "Zapret: не найден winws.exe/стратегия. Укажите network.zapret.base_dir."
+            )
+            return None
+        strategy, exe = found
+        args = self._parse_winws_args(strategy)
+        if not args:
+            self.log.error("Zapret: не удалось разобрать стратегию %s", strategy.name)
+            return None
+
+        kwargs: dict[str, Any] = {}
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                str(exe),
+                *args,
+                cwd=str(strategy.parent),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                **kwargs,
+            )
+        except OSError as exc:
+            self.log.error("Zapret: не удалось запустить winws: %s", exc)
+            return None
+        self._zapret_procs = [proc]
+        await asyncio.sleep(2.0)
+        if proc.returncode is not None or not await self._test_direct():
+            self.log.warning("Zapret: winws не открыл Discord")
+            await self._stop_zapret()
+            return None
+        self._zapret_desc = f"Zapret ({strategy.stem}, WinDivert)"
+        self.log.info("Zapret: стратегия %s работает", strategy.name)
+        return DIRECT_MODE
+
+    async def _start_zapret(self) -> Optional[str]:
+        self._mode = "zapret"
+        self._zapret_active = False
+        self._zapret_desc = ""
+        if os.name == "nt":
+            url = await self._start_zapret_windows()
+        else:
+            url = await self._start_zapret_linux()
+        if url:
+            self._zapret_active = True
+        return url
+
+    async def _stop_zapret(self) -> None:
+        for proc in self._zapret_procs:
+            if proc.returncode is None:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+        self._zapret_procs = []
+        if os.name == "nt":
+            try:
+                subprocess.run(
+                    ["taskkill", "/IM", "winws.exe", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                )
+            except Exception:
+                pass
+        elif os.geteuid() == 0 or self._sudo_ok():
+            await self._run_privileged(["pkill", "-x", "nfqws"], timeout=10)
+            await self._zapret_cleanup_rules()
+        self._zapret_active = False
+
+    async def _zapret_health(self) -> None:
+        if await self._test_direct():
+            return
+        self.log.warning("Zapret: Discord снова недоступен — перезапуск обхода")
+        await self._stop_zapret()
+        url = await self._start_zapret()
+        if url:
+            self._apply(url, "restart")
+            return
+        await self._fallback_from("zapret")
+
     # -- общий watchdog и применение ---------------------------------------
 
     async def _watchdog(self) -> None:
@@ -1399,23 +2207,33 @@ class NetBypassManager:
                     await self._vless_health()
                 elif self._mode == "proxy":
                     await self._proxy_health()
+                elif self._mode == "zapret":
+                    await self._zapret_health()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.log.exception("Ошибка проверки сетевого обхода")
 
     def _apply(self, url: Optional[str], reason: str) -> None:
-        changed = url != self._proxy_url
-        self._proxy_url = url
+        direct = url == DIRECT_MODE
+        target = None if direct else url
+        changed = target != self._proxy_url or direct != self._zapret_active
+        self._proxy_url = target
+        self._zapret_active = direct
         if self._client is not None:
             try:
-                self._client.http.proxy = url
+                self._client.http.proxy = target
             except Exception:
                 self.log.exception("Не удалось обновить прокси в discord.py")
             if changed:
                 self._schedule_reconnect()
         if changed:
-            self.log.info("Сетевой обход переключён (%s): %s", reason, url)
+            if direct:
+                self.log.info(
+                    "Сетевой обход переключён (%s): %s", reason, self.describe()
+                )
+            else:
+                self.log.info("Сетевой обход переключён (%s): %s", reason, url)
 
     def _schedule_reconnect(self) -> None:
         client = self._client

@@ -215,6 +215,82 @@
 
 ---
 
+## Режим `zapret` (обход DPI без сервера)
+
+Zapret не требует подписки и VPN-сервера: он искажает TLS/QUIC-пакеты так,
+чтобы DPI не распознал соединение с Discord. Режим работает прозрачно, поэтому
+discord.py ходит напрямую (`proxy = None`), а обход выполняется на уровне ОС.
+
+```json
+"network": {
+  "enabled": true,
+  "mode": "zapret",
+  "fallback": ["vless", "proxy"],
+  "zapret": {
+    "base_dir": "",
+    "core_path": "",
+    "strategy": "general.bat",
+    "interface": "",
+    "max_strategies": 4
+  }
+}
+```
+
+Бот сам находит папку Zapret: `zapret*` рядом с ботом, в родительском каталоге
+или в домашней папке. Ядро и стратегия определяются автоматически
+(`nfqws` + `nftables` на Linux, `winws.exe` + WinDivert на Windows).
+
+### Linux (Raspberry Pi OS / Debian)
+
+Zapret требует root и пакет `libnetfilter-queue1`:
+
+```bash
+sudo apt update
+sudo apt install -y nftables libnetfilter-queue1
+```
+
+Затем либо запускайте бота через sudo:
+
+```bash
+sudo ./run.sh
+```
+
+либо разрешите `nft` и `nfqws` без пароля:
+
+```bash
+# путь к nfqws подставьте свой (см. network.zapret.base_dir)
+NFQWS=/home/krim/zapret-discord-youtube-linux-arm64/nfqws
+echo "krim ALL=(root) NOPASSWD: /usr/sbin/nft, $NFQWS, /usr/bin/pkill" \
+  | sudo tee /etc/sudoers.d/krim-zapret
+sudo chmod 0440 /etc/sudoers.d/krim-zapret
+```
+
+Бот вызывает `nft -f -` (без промежуточного `sh`), поэтому в sudoers нужен
+только сам `nft`, ядро `nfqws` и `pkill` для очистки процессов.
+
+После этого бот запускается обычным `./run.sh`, а режим `zapret` используется
+как резервный (или основной — по `network.mode`).
+
+### Windows
+
+Нужны права администратора и папка Zapret с `winws.exe` + WinDivert
+(например, сборка Flowseal). Запустите бота от имени администратора.
+
+### Если Zapret не поднялся
+
+Бот пишет причину в лог и переходит к следующему режиму из `fallback`.
+Типичные причины: нет прав root/администратора, не установлен
+`libnetfilter-queue1`, не найден интерфейс (`network.zapret.interface`),
+стратегия не подходит для провайдера (увеличьте `max_strategies`).
+
+**Важно:** Zapret обходит DPI, но не IP-блокировки. Если соединение к
+`discord.com:443` обрывается по TCP-таймауту (curl возвращает `000`, а
+Google при этом открывается), провайдер блокирует адреса на уровне
+маршрутизации — в этом случае поможет только VLESS/прокси/VPN. Проверка:
+`curl -m 8 -o /dev/null -w "%{http_code}" https://discord.com/api/v10/gateway`.
+
+---
+
 ## Ограничения
 
 - **Голосовой канал Discord использует UDP.** HTTP-прокси и VLESS-туннель
